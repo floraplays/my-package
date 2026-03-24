@@ -1,0 +1,199 @@
+{
+  "name": "openai-nim-proxy",
+  "version": "2.0.0",
+  "description": "OpenAI compatible proxy for NVIDIA NIM API with reasoning/thinking support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
+
+package (1).json
+1 KB
+then make a server.js with this
+// server.js - OpenAI to NVIDIA NIM API Proxy
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_KEY  = process.env.NIM_API_KEY;
+
+// Model mapping — OpenAI names → NVIDIA NIM model IDs
+const MODEL_MAPPING = {
+  'gpt-4':           'qwen/qwen3-235b-a22b',
+  'gpt-3.5-turbo':   'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'claude-3-opus':   'qwen/qwen3-235b-a22b',
+  'claude-3-sonnet': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'gpt-4-turbo':     'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'claude-3-haiku':  'deepseek-ai/deepseek-r1-distill-llama-8b',
+  'gemini-pro':      'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'gpt-4o':          'deepseek-ai/deepseek-v3.2',
+  'gpt-4o-mini':     'meta/llama-3.3-70b-instruct',
+};
+
+// These models always output <think> blocks natively — strip them silently
+const NATIVE_THINKERS = new Set([
+  'deepseek-ai/deepseek-r1-distill-qwen-14b',
+  'deepseek-ai/deepseek-r1-distill-llama-8b',
+  'deepseek-ai/deepseek-r1-distill-qwen-32b',
+]);
+
+// Strip <think>...</think> blocks from a completed string
+function stripThinking(text) {
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  text = text.replace(/<think>[\s\S]*/gi, '');
+  return text.trimStart();
+}
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'OpenAI → NVIDIA NIM Proxy',
+    thinking: 'disabled',
+    nim_base: NIM_API_BASE,
+    api_key_set: !!NIM_API_KEY,
+  });
+});
+
+// List models
+app.get('/v1/models', (req, res) => {
+  const models = Object.keys(MODEL_MAPPING).map(id => ({
+    id,
+    object: 'model',
+    created: 1700000000,
+    owned_by: 'nvidia-nim-proxy',
+  }));
+  res.json({ object: 'list', data: models });
+});
+
+// Main proxy
+app.post('/v1/chat/completions', async (req, res) => {
+  if (!NIM_API_KEY) {
+    return res.status(500).json({ error: { message: 'NIM_API_KEY not set', type: 'server_error' } });
+  }
+
+  try {
+    const { model, messages, temperature, max_tokens, stream } = req.body;
+    const nimModel = MODEL_MAPPING[model] || model;
+    const isNativeThinker = NATIVE_THINKERS.has(nimModel);
+
+    const ts = () => new Date().toISOString();
+    console.log(`\n${'─'.repeat(60)}`);
+    console.log(`[${ts()}] REQUEST — ${model} → ${nimModel}`);
+    console.log(`Stream: ${stream || false} | Max tokens: ${max_tokens || 16384}`);
+    console.log(`Messages (${messages.length}):`);
+    messages.forEach((msg, i) => {
+      const preview = typeof msg.content === 'string'
+        ? msg.content.slice(0, 300) + (msg.content.length > 300 ? '…' : '')
+        : '[non-text content]';
+      console.log(`  [${i}] ${msg.role.toUpperCase()}: ${preview}`);
+    });
+
+    const nimRequestBody = {
+      model: nimModel,
+      messages,
+      temperature: temperature ?? 0.6,
+      max_tokens: max_tokens || 16384,
+      stream: stream || false,
+    };
+
+    const response = await axios.post(
+      `${NIM_API_BASE}/chat/completions`,
+      nimRequestBody,
+      {
+        headers: {
+          'Authorization': `Bearer ${NIM_API_KEY}`,
+... (157 lines left)# This workflow will build and push a node.js application to an Azure Web App when a commit is pushed to your default branch.
+#
+# This workflow assumes you have already created the target Azure App Service web app.
+# For instructions see https://docs.microsoft.com/en-us/azure/app-service/quickstart-nodejs?tabs=linux&pivots=development-environment-cli
+#
+# To configure this workflow:
+#
+# 1. Download the Publish Profile for your Azure Web App. You can download this file from the Overview page of your Web App in the Azure Portal.
+#    For more information: https://docs.microsoft.com/en-us/azure/app-service/deploy-github-actions?tabs=applevel#generate-deployment-credentials
+#
+# 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
+#    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
+#
+# 3. Change the value for the AZURE_WEBAPP_NAME. Optionally, change the AZURE_WEBAPP_PACKAGE_PATH and NODE_VERSION environment variables below.
+#
+# For more information on GitHub Actions for Azure: https://github.com/Azure/Actions
+# For more information on the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
+# For more samples to get started with GitHub Action workflows to deploy to Azure: https://github.com/Azure/actions-workflow-samples
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  AZURE_WEBAPP_NAME: your-app-name    # set this to your application's name
+  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
+  NODE_VERSION: '20.x'                # set this to the node version to use
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: npm install, build, and test
+      run: |
+        npm install
+        npm run build --if-present
+        npm run test --if-present
+
+    - name: Upload artifact for deployment job
+      uses: actions/upload-artifact@v4
+      with:
+        name: node-app
+        path: .
+
+  deploy:
+    permissions:
+      contents: none
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Development'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+
+    steps:
+    - name: Download artifact from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: node-app
+
+    - name: 'Deploy to Azure WebApp'
+      id: deploy-to-webapp
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
