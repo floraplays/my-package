@@ -19,42 +19,42 @@ app.use(express.json({ limit: '10mb' }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY  = process.env.NIM_API_KEY;
 
-// How many times to retry a request when NIM returns 429, 503, or 504.
-// Timeouts (ECONNABORTED) are NOT retried — retrying a hung connection
-// stacks more hung connections and can exhaust Render's memory.
 const MAX_RETRIES    = 2;
-const RETRY_DELAY_MS = 500;
+const RETRY_DELAY_MS = 1000;
 
-// Render only kills a connection if NO data is sent within its idle window.
-// For streaming responses, once the first token arrives the connection stays open.
-// 55 seconds gives the model enough queue time on busy days without risking
-// the stacking problem that caused 502s (which was from 180s hung requests).
-const REQUEST_TIMEOUT_MS = 55000;
+const MIN_REQUEST_INTERVAL_MS = 20000;
 
-// Per-model token limits.
+let lastRequestTime = 0;
+
+async function waitForRateLimit(id) {
+  const elapsed = Date.now() - lastRequestTime;
+  const wait    = MIN_REQUEST_INTERVAL_MS - elapsed;
+  if (wait > 0) {
+    console.log(`[${now()}] [${id}] Rate limiter: waiting ${Math.round(wait / 1000)}s before calling NIM`);
+    await sleep(wait);
+  }
+  lastRequestTime = Date.now();
+}
+
+const REQUEST_TIMEOUT_MS = 120000;
+
 const MODEL_MAX_TOKENS = {
   'deepseek-ai/deepseek-v4-pro':   800,
   'deepseek-ai/deepseek-v4-flash': 800,
 };
 
-// If V4-pro times out, try V4-flash before giving up.
-// V3.x models all retired as of May 4 2026 — no older fallback available.
 const FALLBACK_MODEL = {
   'deepseek-ai/deepseek-v4-pro': 'deepseek-ai/deepseek-v4-flash',
 };
 
-// OpenAI alias -> NVIDIA NIM model ID.
-// Last verified: May 9 2026.
-// v3.1-terminus retired April 15 2026, v3.2 retired May 4 2026 — both 410 Gone.
-// V4 models are the only live DeepSeek models on the hosted NIM API.
+// Last verified: May 2026.
+// v3.x all retired. V4 models are the only live DeepSeek models on hosted NIM.
 const MODEL_MAPPING = {
-  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',    // 1.6T params, 49B active
-  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',  // 284B params, 13B active — faster
+  'deepseek-v4':       'deepseek-ai/deepseek-v4-pro',
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
 };
 
-// V4 models require chat_template_kwargs to respond at all.
-// enable_thinking: false = Non-think (fast) mode — responses start immediately.
-// enable_thinking: true  = Think High/Max — model reasons before responding, causes timeouts.
+// V4 models require both these fields or they hang indefinitely.
 const REQUIRES_THINKING_PARAM = new Set([
   'deepseek-ai/deepseek-v4-pro',
   'deepseek-ai/deepseek-v4-flash',
@@ -63,16 +63,17 @@ const REQUIRES_THINKING_PARAM = new Set([
 // No current models emit inline <think> tags.
 const NATIVE_THINKERS = new Set([]);
 
-// Generation parameters forwarded verbatim to NIM when present on the request.
+// Parameters forwarded to NIM at the root level.
+// min_p, stream_options, n, top_k excluded — NIM rejects them with 400.
 const FORWARDED_PARAMS = [
-  'temperature', 'top_p', 'top_k', 'min_p',
+  'temperature', 'top_p',
   'max_tokens', 'stop',
   'frequency_penalty', 'presence_penalty',
-  'seed', 'n', 'stream_options',
+  'seed',
 ];
 
-// HTTP status codes that indicate transient server congestion and are safe to retry.
-const RETRYABLE_STATUSES = new Set([429, 503, 504]);
+// 429 excluded — prevented by rate limiter above, not retried.
+const RETRYABLE_STATUSES = new Set([503, 504]);
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -277,7 +278,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log(`  [${i}] ${msg.role.toUpperCase()}: ${contentPreview(msg.content)}`);
   });
 
-  // --- Build NIM request body -----------------------------------------------
+  // --- Build request body ---------------------------------------------------
   const nimBody = { model: nimModel, messages, stream: isStream };
 
   for (const param of FORWARDED_PARAMS) {
@@ -287,15 +288,9 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (nimBody.max_tokens  === undefined) {
     nimBody.max_tokens = MODEL_MAX_TOKENS[nimModel] ?? 4096;
   }
-  if (nimBody.temperature  === undefined) nimBody.temperature  = 0.6;
+  if (nimBody.temperature === undefined) nimBody.temperature = 0.6;
 
-  // V4 models hang permanently without this parameter — inject it unconditionally.
-  // Reasoning output arrives in reasoning_content and is stripped before delivery.
-  if (REQUIRES_THINKING_PARAM.has(nimModel)) {
-    nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
-  }
-
-  // --- Call NIM with retry on transient errors ------------------------------
+  // --- Call NIM with retry --------------------------------------------------
   let response;
   let lastErr;
   let activeModel = nimModel;
@@ -303,24 +298,22 @@ app.post('/v1/chat/completions', async (req, res) => {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     nimBody.model = activeModel;
 
-  // V4 models require this parameter or they hang indefinitely.
-  // enable_thinking: false = Non-think (fast) mode, responses start immediately.
-  if (REQUIRES_THINKING_PARAM.has(activeModel)) {
-    nimBody.chat_template_kwargs = { enable_thinking: false, thinking: false };
-  } else {
-    delete nimBody.chat_template_kwargs;
-  }
+    if (REQUIRES_THINKING_PARAM.has(activeModel)) {
+      nimBody.chat_template_kwargs = { enable_thinking: true, thinking: true };
+    } else {
+      delete nimBody.chat_template_kwargs;
+    }
 
     try {
+      await waitForRateLimit(id);
       response = await callNIM(nimBody, isStream, id);
       lastErr  = null;
       break;
     } catch (err) {
       lastErr = err;
-      const status  = err.response?.status;
+      const status    = err.response?.status;
       const isTimeout = err.code === 'ECONNABORTED';
 
-      // On timeout, try falling back to the stable model before giving up
       if (isTimeout && FALLBACK_MODEL[activeModel]) {
         const fallback = FALLBACK_MODEL[activeModel];
         console.warn(`[${now()}] [${id}] ${activeModel} timed out — falling back to ${fallback}`);
@@ -329,12 +322,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         continue;
       }
 
-      // Do not retry timeouts — stacking hung connections exhausts Render memory
       if (isTimeout) break;
 
       if (attempt < MAX_RETRIES && RETRYABLE_STATUSES.has(status)) {
         const wait = RETRY_DELAY_MS * (attempt + 1);
-        console.warn(`[${now()}] [${id}] NIM returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.warn(`[${now()}] [${id}] OpenRouter returned ${status}, retrying in ${wait}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
         await sleep(wait);
         continue;
       }
@@ -494,63 +486,73 @@ app.all('*', (req, res) => {
 
 function handleAxiosError(err, id, res) {
   const status = err.response?.status;
-  let detail   = err.message;
 
-  // Distinguish timeout and connection reset from API errors for clearer logs
+  return resolveErrorDetail(err, status).then(detail => {
+    console.error(`[${now()}] [${id}] PROXY ERROR [${status || 500}]: ${preview(detail, 500)}`);
+
+    if (!res.headersSent) {
+      const httpStatus = status || 500;
+      res.status(httpStatus).json({
+        error: {
+          message: detail || 'An error occurred communicating with the NIM API',
+          type:    httpStatus >= 500 ? 'server_error' : 'invalid_request_error',
+          code:    httpStatus,
+        },
+      });
+    }
+  });
+}
+
+// Resolves the readable error body properly instead of racing a synchronous .read().
+async function resolveErrorDetail(err, status) {
   if (err.code === 'ECONNABORTED') {
-    detail = `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s with no response from NIM`;
-  } else if (err.code === 'ECONNRESET') {
-    detail = 'NIM closed the connection unexpectedly (likely server-side congestion)';
-  } else if (err.response?.data) {
-    const raw = err.response.data;
-    if (typeof raw === 'string') {
-      detail = raw;
-    } else if (Buffer.isBuffer(raw)) {
-      detail = raw.toString('utf8');
-    } else if (raw && typeof raw.read === 'function') {
-      // Readable stream — happens when responseType is 'stream' and NIM returns a 4xx/5xx.
-      // The error body is already buffered internally; read it out synchronously.
-      try {
-        const chunks = [];
-        let chunk;
-        while (null !== (chunk = raw.read())) {
-          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-        }
-        detail = chunks.length > 0
-          ? Buffer.concat(chunks).toString('utf8')
-          : `[Empty stream body — HTTP ${status}]`;
-      } catch (_) {
-        detail = `[Could not read stream error body — HTTP ${status}]`;
-      }
-    } else if (typeof raw === 'object') {
-      // Plain object — safe to stringify with circular reference guard
-      try {
-        const seen = new WeakSet();
-        detail = JSON.stringify(raw, (key, value) => {
-          if (typeof value === 'object' && value !== null) {
-            if (seen.has(value)) return '[Circular]';
-            seen.add(value);
-          }
-          return value;
-        });
-      } catch (_) {
-        detail = `[Unserializable error object: ${raw?.constructor?.name || 'unknown'}]`;
-      }
+    return `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s with no response from NIM`;
+  }
+  if (err.code === 'ECONNRESET') {
+    return 'NIM closed the connection unexpectedly (likely server-side congestion)';
+  }
+
+  const raw = err.response?.data;
+  if (!raw) return err.message;
+
+  if (typeof raw === 'string') return raw;
+  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
+
+  // Readable stream — wait for it to actually finish emitting data before reading.
+  if (raw && typeof raw.on === 'function') {
+    try {
+      const chunks = await new Promise((resolve, reject) => {
+        const collected = [];
+        raw.on('data', (chunk) => collected.push(chunk));
+        raw.on('end', () => resolve(collected));
+        raw.on('error', reject);
+        // Safety timeout in case the stream never emits 'end'
+        setTimeout(() => resolve(collected), 3000);
+      });
+      return chunks.length > 0
+        ? Buffer.concat(chunks).toString('utf8')
+        : `[Empty stream body — HTTP ${status}]`;
+    } catch (_) {
+      return `[Could not read stream error body — HTTP ${status}]`;
     }
   }
 
-  const httpStatus = status || 500;
-  console.error(`[${now()}] [${id}] PROXY ERROR [${httpStatus}]: ${preview(detail, 500)}`);
-
-  if (!res.headersSent) {
-    res.status(httpStatus).json({
-      error: {
-        message: detail || 'An error occurred communicating with the NIM API',
-        type:    httpStatus >= 500 ? 'server_error' : 'invalid_request_error',
-        code:    httpStatus,
-      },
-    });
+  if (typeof raw === 'object') {
+    try {
+      const seen = new WeakSet();
+      return JSON.stringify(raw, (key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          if (seen.has(value)) return '[Circular]';
+          seen.add(value);
+        }
+        return value;
+      });
+    } catch (_) {
+      return `[Unserializable error object: ${raw?.constructor?.name || 'unknown'}]`;
+    }
   }
+
+  return String(raw);
 }
 
 // ---------------------------------------------------------------------------
